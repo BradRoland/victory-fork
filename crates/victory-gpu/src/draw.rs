@@ -1377,15 +1377,7 @@ impl State {
             .filter(|&&h| h != 0)
             .map(|&h| crate::descriptor::heap(h as This))
             .find(|h| !h.samplers())?;
-        let host = heap.host()?;
-        let gpu = host.addresses_gpu()?;
-        const ONCE: usize = usize::MAX - 0x5f;
-        if list.first_use(ONCE)
-            && let Some(buffer) = host.addresses_buffer()
-        {
-            list.keep(buffer);
-        }
-        Some(gpu)
+        heap.host()?.addresses_gpu(list)
     }
 
     /// For a shader that picks buffers from the view heap by an index it

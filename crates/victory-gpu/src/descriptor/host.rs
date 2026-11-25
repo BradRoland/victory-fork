@@ -1133,15 +1133,12 @@ impl HostHeap {
         self.strides.as_ref().map(|s| &s.0)
     }
 
-    /// The GPU address of the table of buffer addresses by title slot (view
-    /// heaps).
-    pub(crate) fn addresses_gpu(&self) -> Option<u64> {
-        self.addresses.as_ref().map(|a| a.1)
-    }
-
-    /// The buffer-address table's buffer, for a list to hold.
-    pub(crate) fn addresses_buffer(&self) -> Option<&ID3D12Resource> {
-        self.addresses.as_ref().map(|a| &a.0)
+    /// The GPU address of this view heap's buffer-address table. A root SRV
+    /// names the separate upload buffer, so the list must also hold it.
+    pub(crate) fn addresses_gpu(&self, list: &crate::host::HostList) -> Option<u64> {
+        let (buffer, gpu, _) = self.addresses.as_ref()?;
+        list.keep_address_table(buffer);
+        Some(*gpu)
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each

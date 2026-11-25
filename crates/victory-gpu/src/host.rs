@@ -739,6 +739,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_list_holds_each_bound_view_address_table_until_reset() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let a = crate::descriptor::host::HostHeap::new(false, 4).unwrap();
+        let b = crate::descriptor::host::HostHeap::new(false, 4).unwrap();
+        let first = a.addresses_gpu(&list).unwrap();
+        let second = b.addresses_gpu(&list).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(a.addresses_gpu(&list), Some(first));
+        let held = || {
+            list.deferred()
+                .address_tables
+                .iter()
+                // SAFETY: the list holds each buffer.
+                .map(|buffer| unsafe { buffer.GetGPUVirtualAddress() })
+                .collect::<Vec<_>>()
+        };
+        assert!(!list.untouched());
+        list.close();
+        assert_eq!(held(), [first, second]);
+        list.reset();
+        assert!(held().is_empty());
+        assert_eq!(b.addresses_gpu(&list), Some(second));
+        assert_eq!(held(), [second]);
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -1639,6 +1666,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Buffer-address tables bound as root SRVs, one per view heap used.
+    address_tables: Vec<ID3D12Resource>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -4943,6 +4972,7 @@ impl HostList {
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
+                && deferred.address_tables.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty())
@@ -5156,6 +5186,19 @@ impl HostList {
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
+        }
+    }
+
+    /// Retains each view heap's address table until reset. A list can
+    /// switch heaps between dispatches or bind the same table repeatedly.
+    pub(crate) fn keep_address_table(&self, buffer: &ID3D12Resource) {
+        let mut deferred = self.deferred();
+        if !deferred
+            .address_tables
+            .iter()
+            .any(|held| held.as_raw() == buffer.as_raw())
+        {
+            deferred.address_tables.push(buffer.clone());
         }
     }
 
