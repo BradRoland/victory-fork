@@ -1268,17 +1268,35 @@ mod tests {
     /// the console's range-checked load reads, a call a dword or
     /// (`VICTORY_SHADER_OPT` with 64) a call for every four: also where a
     /// call's four dwords lie across the view's end (the dwords out of it
-    /// are 0, the others are read). On the software adapter only: run the
-    /// test once plain and once with `VICTORY_SHADER_OPT=127`.
+    /// are 0, the others are read). Use VICTORY_WARP=0 for the default
+    /// adapter. Run once plain and once with `VICTORY_SHADER_OPT=127`.
     #[test]
     #[cfg(windows)]
     fn scalar_buffer_loads_read_the_same_dwords_one_call_or_four() {
+        check_scalar_loads(crate::RootType::Table);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn scalar_buffer_loads_from_a_runtime_heap_slot_do_not_wrap() {
+        check_scalar_loads(crate::RootType::ResourceHeap);
+    }
+
+    #[cfg(windows)]
+    fn check_scalar_loads(source: crate::RootType) {
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let warp = std::env::var("VICTORY_WARP").as_deref() != Ok("0");
+        let Ok(host) = super::host::Host::new(warp) else {
+            eprintln!("no D3D12 adapter for the scalar load regression (warp={warp})");
+            return;
+        };
+        let from_heap = source == crate::RootType::ResourceHeap;
         // (first register, dwords) of the three loads, in order.
         const LOADS: [(u32, u32); 3] = [(16, 8), (24, 4), (32, 16)];
         let mut words: Vec<u32> = vec![
             0xBE85_0380, // s_mov_b32 s5, 0
             0xF408_0202,
-            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (the SRV)
+            if from_heap { 0x0400_0000 } else { 0xFA00_0000 }, // SRV descriptor at s2 or 0
             0xF408_0302,
             0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (the UAV)
             0xF42C_0404,
@@ -1324,7 +1342,7 @@ mod tests {
                     slot: 0,
                 },
                 crate::RootParam {
-                    root: crate::RootType::Table,
+                    root: source,
                     table_offset_dwords: 0,
                     sgprs: 1,
                     base_register: 0,
@@ -1332,7 +1350,11 @@ mod tests {
                     slot: 1,
                 },
             ],
-            used: vec![table(crate::ResourceType::Srv, 0), table(crate::ResourceType::Uav, 8)],
+            used: if from_heap {
+                Vec::new()
+            } else {
+                vec![table(crate::ResourceType::Srv, 0), table(crate::ResourceType::Uav, 8)]
+            },
             io: crate::native::StageIo::Cs(crate::native::ComputeIo {
                 rsrc2: 5 << 1,
                 threads: [1, 1, 1],
@@ -1363,11 +1385,6 @@ mod tests {
         ) {
             v.validate(&mut dxil).unwrap();
         }
-        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-        let Ok(host) = super::host::Host::new(true) else {
-            eprintln!("no software adapter; the dispatch is skipped");
-            return;
-        };
         let cs = super::HostShader {
             stage: super::HwStage::Cs,
             dxil,
@@ -1382,34 +1399,51 @@ mod tests {
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
         let data: Vec<u32> = (0..12u32).map(|i| 0x1111_1111u32.wrapping_mul(i + 1) ^ 0x8000_0000).collect();
-        let dword = |byte: u64| -> u32 {
-            if byte.is_multiple_of(4) && byte + 4 <= 4 * data.len() as u64 { data[(byte / 4) as usize] } else { 0 }
-        };
+        // Two different raw SRVs at heap slots 0 and 2. An in-bounds load
+        // must see the selected buffer's contents and its own shorter bound.
+        let other: Vec<_> = data[..9].iter().map(|word| word ^ 0x5aa5_6996).collect();
+        if from_heap {
+            assert_eq!(cs.root_srvs, [super::SLOT_STRIDES]);
+        }
         // Also cover a carry in the starting offset and loads just below 4 GiB.
         // Every dword past the end of the address range must read zero.
-        for (s0, s1) in [
-            (0u32, 0u32),
-            (16, 0),
-            (24, 4),
-            (40, 28),
-            (48, 44),
-            (8, 12),
-            (0xffff_fffc, 0xffff_fff8),
-            (0xffff_fff0, 0xffff_ffdc),
-            (0, 0xffff_fffc),
+        for (s0, s1, slot) in [
+            (0u32, 0u32, 0u32),
+            (0, 0, 2),
+            (16, 0, 2),
+            (24, 4, 0),
+            (40, 28, 2),
+            (48, 44, 0),
+            (8, 12, 2),
+            (0xffff_fffc, 0xffff_fff8, 0),
+            (0xffff_fff0, 0xffff_ffdc, 2),
+            (0, 0xffff_fffc, 2),
         ] {
+            let mut constants = vec![0; cs.user_data_dwords() as usize];
+            constants[0] = s0;
+            constants[1] = s1;
+            if from_heap {
+                constants[2] = slot * 32;
+            }
+            let mut roots = vec![(0, super::host::Root::Constants(constants))];
+            if from_heap {
+                // The runtime supplies this root SRV to distinguish a buffer
+                // from a constant buffer when the shader picks its heap slot.
+                roots.push((1, super::host::Root::View { srv: true, data: vec![4; 3] }));
+            }
             let out = host
                 .dispatch(
                     &root,
                     &pso,
                     &super::host::Dispatch {
-                        roots: vec![(0, super::host::Root::Constants(vec![s0, s1, 0, 0, 0]))],
+                        roots,
                         views: &[
                             super::host::View::Buffer {
                                 data: &data,
                                 stride: super::host::Stride::Raw,
                             },
                             super::host::View::RawUav(32),
+                            super::host::View::Buffer { data: &other, stride: super::host::Stride::Raw },
                         ],
                         samplers: &[],
                         groups: [1, 1, 1],
@@ -1418,12 +1452,21 @@ mod tests {
                 .unwrap();
             let starts = [u64::from(s0), 8, u64::from(s1) + 4];
             let mut want = Vec::new();
+            let input = if from_heap && slot == 2 { &other } else { &data };
+            let dword = |byte: u64| {
+                if byte.is_multiple_of(4) && byte < (input.len() * 4) as u64 {
+                    input[(byte / 4) as usize]
+                } else {
+                    0
+                }
+            };
             for (&(_, n), start) in LOADS.iter().zip(starts) {
                 want.extend((0..u64::from(n)).map(|k| dword(start + 4 * k)));
             }
-            eprintln!("offsets {s0} and {s1}, four dwords a call: {wide}: {:x?}", &out[0][..28]);
-            assert_eq!(out[0][..28], want[..], "offsets {s0} and {s1}, four dwords a call: {wide}");
+            assert_eq!(out[0][..28], want[..],
+                "{source:?}, slot {slot}, offsets {s0:#x} and {s1:#x}, four dwords a call: {wide}");
         }
+        eprintln!("checked scalar loads through {source:?}, warp={warp}, four dwords a call={wide}");
     }
 
     #[test]
