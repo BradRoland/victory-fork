@@ -132,16 +132,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p, REQUESTED);
         let frame = crate::frame::current();
-        let first = match p.waited_frame.compare_exchange(
-            u64::MAX,
-            frame,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => frame,
-            Err(f) => f,
-        };
-        if first == frame {
+        let first = p.waited_frame.load(Ordering::Relaxed);
+        if first == u64::MAX || first == frame {
             wait(p, frame);
         }
     }
@@ -189,18 +181,29 @@ fn wait(p: &Pending, frame: u64) {
     let shared = shared_budget();
     let left = {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        // A recording thread can reach this lock after a newer frame has
+        // started spending. Keep the newer frame's account intact.
+        if spent.0 != u64::MAX && frame < spent.0 {
+            return;
+        }
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
         let left = budget.saturating_sub(spent.1);
+        // Only a caller with time left spends this pipeline's first wait.
+        // The budget lock serializes claims by recording threads in both modes.
+        let first = p.waited_frame.load(Ordering::Relaxed);
+        if left.is_zero() || (first != u64::MAX && first != frame) {
+            return;
+        }
+        if first == u64::MAX {
+            p.waited_frame.store(frame, Ordering::Relaxed);
+        }
         if shared {
             spent.1 += left;
         }
         left
     };
-    if left.is_zero() {
-        return;
-    }
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
