@@ -3761,3 +3761,6 @@ mod tests {
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
     }
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod placed_water_test;
