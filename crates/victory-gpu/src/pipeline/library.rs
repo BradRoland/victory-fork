@@ -785,6 +785,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failed_early_list_replacement_is_retried_without_new_pipelines() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // The cache directory, device and list of used keys are process-wide.
+        const CHILD: &str = "VICTORY_TEST_EARLY_LIST_RETRY";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap(), "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        use_pipeline_cache(dir.path().into());
+        if library().is_none() {
+            eprintln!("skipping early list replacement test: no host pipeline library");
+            return;
+        }
+        let path = dir.path().join(EARLY_FILE);
+        let old = "11111111111111111111111111111111";
+        let new = "22222222222222222222222222222222";
+        std::fs::write(&path, old).unwrap();
+        assert!(wanted_early(old));
+        note_used(new);
+
+        // Allow reads but deny the delete sharing required for a rename.
+        let busy = std::fs::File::options().read(true).share_mode(1).open(&path).unwrap();
+        save(true);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+        drop(busy);
+        save(true);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(saved.lines().collect::<HashSet<_>>(), HashSet::from([old, new]));
+    }
+
+    #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
         let a = name("graphics", b"root", &[b"vs", b"ps"], "state");
         assert_eq!(a, name("graphics", b"root", &[b"vs", b"ps"], "state"));
