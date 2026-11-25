@@ -438,3 +438,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+#[path = "wait_replay.rs"]
+mod wait_replay;
